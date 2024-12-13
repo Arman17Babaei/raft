@@ -19,6 +19,7 @@ const _ = grpc.SupportPackageIsVersion7
 type RaftClient interface {
 	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
 	RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error)
+	PleaseDoThis(ctx context.Context, in *RequestPleaseRequest, opts ...grpc.CallOption) (*RequestPleaseResponse, error)
 }
 
 type raftClient struct {
@@ -47,12 +48,22 @@ func (c *raftClient) RequestVote(ctx context.Context, in *RequestVoteRequest, op
 	return out, nil
 }
 
+func (c *raftClient) PleaseDoThis(ctx context.Context, in *RequestPleaseRequest, opts ...grpc.CallOption) (*RequestPleaseResponse, error) {
+	out := new(RequestPleaseResponse)
+	err := c.cc.Invoke(ctx, "/raft.Raft/PleaseDoThis", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftServer is the server API for Raft service.
 // All implementations must embed UnimplementedRaftServer
 // for forward compatibility
 type RaftServer interface {
 	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
 	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
+	PleaseDoThis(context.Context, *RequestPleaseRequest) (*RequestPleaseResponse, error)
 	mustEmbedUnimplementedRaftServer()
 }
 
@@ -65,6 +76,9 @@ func (UnimplementedRaftServer) AppendEntries(context.Context, *AppendEntriesRequ
 }
 func (UnimplementedRaftServer) RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RequestVote not implemented")
+}
+func (UnimplementedRaftServer) PleaseDoThis(context.Context, *RequestPleaseRequest) (*RequestPleaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PleaseDoThis not implemented")
 }
 func (UnimplementedRaftServer) mustEmbedUnimplementedRaftServer() {}
 
@@ -115,6 +129,24 @@ func _Raft_RequestVote_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Raft_PleaseDoThis_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RequestPleaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServer).PleaseDoThis(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/raft.Raft/PleaseDoThis",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServer).PleaseDoThis(ctx, req.(*RequestPleaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 var _Raft_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "raft.Raft",
 	HandlerType: (*RaftServer)(nil),
@@ -126,6 +158,10 @@ var _Raft_serviceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RequestVote",
 			Handler:    _Raft_RequestVote_Handler,
+		},
+		{
+			MethodName: "PleaseDoThis",
+			Handler:    _Raft_PleaseDoThis_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

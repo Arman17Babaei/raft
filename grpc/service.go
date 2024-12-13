@@ -16,12 +16,13 @@ import (
 type RaftService struct {
 	mu sync.Mutex
 	node *raft.Node
+	pleaseCh chan *pb.RequestPleaseRequest
 
 	pb.UnimplementedRaftServer
 }
 
-func NewRaftService(node *raft.Node, port int) *RaftService {
-	raftService := &RaftService{node: node}
+func NewRaftService(node *raft.Node, port int, pleaseCh chan *pb.RequestPleaseRequest) *RaftService {
+	raftService := &RaftService{node: node, pleaseCh: pleaseCh}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -57,4 +58,15 @@ func (rs *RaftService) RequestVote(ctx context.Context, req *pb.RequestVoteReque
 	fmt.Printf("RequestVote received: %+v\n", req)
 
 	return rs.node.RequestVoteHandler(req)
+}
+
+func (rs *RaftService) PleaseDoThis(ctx context.Context, req *pb.RequestPleaseRequest) (*pb.RequestPleaseResponse, error) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	
+	fmt.Printf("PleaseDoThis received: %+v\n", req)
+
+	rs.pleaseCh <- req
+
+	return &pb.RequestPleaseResponse{Success: true}, nil
 }

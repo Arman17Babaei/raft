@@ -32,9 +32,20 @@ message RequestVoteResponse {
 message LogEntry {
   int32 term = 1;
   string command = 2;
+  string uuid = 3;
+}
+
+message RequestPleaseRequest {
+  string command = 1;
+  string uuid = 2;
+}
+
+message RequestPleaseResponse {
+  bool success = 1;
 }
 
 service Raft {
   rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
+  rpc PleaseDoThis (RequestPleaseRequest) returns (RequestPleaseResponse);
 }

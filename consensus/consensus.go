@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	pb "github.com/Arman17Babaei/raft/grpc/proto"
 	"github.com/Arman17Babaei/raft/grpc"
 	"github.com/Arman17Babaei/raft/raft"
 )
@@ -52,10 +53,11 @@ func (cm *ConsensusManager) Start() {
 	cm.raftStarted = true
 	cm.requestCh = make(chan raft.Request, 20)
 	cm.commandCh = make(chan string)
-	node := raft.NewNode(cm.myPort, cm.otherPorts, cm.requestCh, cm.commandCh)
+	pleaseCh := make(chan *pb.RequestPleaseRequest, 20)
+	node := raft.NewNode(cm.myPort, cm.otherPorts, cm.requestCh, cm.commandCh, pleaseCh)
 	cm.raftCluster = &RaftCluster{
 		Node:        node,
-		RaftService: grpc.NewRaftService(node, cm.myPort),
+		RaftService: grpc.NewRaftService(node, cm.myPort, pleaseCh),
 	}
 	cm.raftCluster.Node.StartElection()
 	go cm.listenForCommands()

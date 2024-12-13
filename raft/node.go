@@ -3,12 +3,18 @@ package raft
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
 
 	pb "github.com/Arman17Babaei/raft/grpc/proto"
+	"github.com/google/uuid"
 )
+
+const SEND_TIMEOUT = 400 * time.Millisecond
+const HEARTBEAT_INTERVAL = 600 * time.Millisecond
+var ELECTION_TIMEOUT = 1500 * time.Millisecond + (time.Duration(rand.Int() % 500) * time.Millisecond)
 
 type Role string
 
@@ -42,10 +48,11 @@ type Node struct {
 
 	RequestCh chan Request
 	CommandCh chan string
-	Callbacks []chan bool
+	PleaseCh  chan *pb.RequestPleaseRequest
+	Callbacks map[string]chan bool
 }
 
-func NewNode(id int, others []int, requestCh chan Request, commandCh chan string) *Node {
+func NewNode(id int, others []int, requestCh chan Request, commandCh chan string, pleaseCh chan *pb.RequestPleaseRequest) *Node {
 	node := &Node{
 		Id:          id,
 		Role:        Follower,
@@ -64,14 +71,15 @@ func NewNode(id int, others []int, requestCh chan Request, commandCh chan string
 
 		RequestCh: requestCh,
 		CommandCh: commandCh,
-		Callbacks: make([]chan bool, 0),
+		PleaseCh:  pleaseCh,
+		Callbacks: make(map[string]chan bool, 0),
 	}
-    for _, peer := range others {
-        node.NextIndex[peer] = 0
-        node.MatchIndex[peer] = -1
-    }
+	for _, peer := range others {
+		node.NextIndex[peer] = 0
+		node.MatchIndex[peer] = -1
+	}
 	go node.listenForRequests()
-    go node.waitForElection()
+	go node.waitForElection()
 	return node
 }
 
@@ -107,12 +115,12 @@ func (n *Node) sendRequestVote(peerID int) {
 	}
 	response, err := SendRPCToPeer(peerID, "RequestVote", request) // Implement sendRPCToPeer
 	if err != nil {
-		log.Printf("[Node %d] Failed to contact peer %d: %v", n.Id, peerID, err)
+		// log.Printf("[Node %d] Failed to contact peer %d: %v", n.Id, peerID, err)
 		return
 	}
 
 	// Process the vote response
-    log.Printf("[Node %d] Received vote response from %d: %+v", n.Id, peerID, response)
+	// log.Printf("[Node %d] Received vote response from %d: %+v", n.Id, peerID, response)
 	n.processVoteResponse(response.(*pb.RequestVoteResponse))
 }
 
@@ -121,31 +129,32 @@ func (n *Node) processVoteResponse(response *pb.RequestVoteResponse) {
 	defer n.Mu.Unlock()
 
 	if int(response.Term) > n.CurrentTerm {
+		n.LeaderId = nil
 		n.becomeFollower(int(response.Term))
 		return
 	}
 
 	if response.VoteGranted {
 		n.Votes++
-		if n.Votes > len(n.Peers)/2 {
+		if n.Votes >= len(n.Peers)/2 {
 			n.becomeLeader()
 		}
 	}
 
-    log.Printf("[Node %d] Votes: %d", n.Id, n.Votes)
+	log.Printf("[Node %d] Votes: %d", n.Id, n.Votes)
 }
 
 func (n *Node) becomeFollower(term int) {
 	log.Printf("[Node %d] Becoming follower for term %d", n.Id, term)
 	n.Role = Follower
 	n.CurrentTerm = term
-	n.VotedFor = nil    
+	n.VotedFor = nil
 }
 
 func (n *Node) becomeLeader() {
-    if n.Role == Leader {
-        return
-    }
+	if n.Role == Leader {
+		return
+	}
 
 	log.Printf("[Node %d] Becoming leader for term %d", n.Id, n.CurrentTerm)
 	n.Role = Leader
@@ -155,20 +164,19 @@ func (n *Node) becomeLeader() {
 
 func (n *Node) waitForElection() {
 	for {
-        select {
-        case <-time.After(10 * time.Second):
-            if n.Role != Leader {
-                n.StartElection()
-            }
-        case <-n.HeartbeatCh:
-            // Received a valid heartbeat; become follower
-            n.becomeFollower(n.CurrentTerm)
-        }
-    }
+		select {
+		case <-time.After(ELECTION_TIMEOUT):
+			if n.Role != Leader {
+				n.StartElection()
+			}
+		case <-n.HeartbeatCh:
+			n.becomeFollower(n.CurrentTerm)
+		}
+	}
 }
 
 func (n *Node) startHeartbeat() {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(HEARTBEAT_INTERVAL)
 	go func() {
 		for range ticker.C {
 			if n.Role != Leader {
@@ -188,11 +196,10 @@ func (n *Node) broadcastAppendEntries() {
 
 func (n *Node) sendAppendEntries(peerID int) {
 	n.Mu.Lock()
-	defer n.Mu.Unlock()
 
 	// Prepare AppendEntries RPC
 	prevLogIndex := n.NextIndex[peerID] - 1
-    log.Printf("[Node %d] Sending logs: %v", n.Id, n.Log)
+	// log.Printf("[Node %d] Sending logs: %v", n.Id, n.Log)
 	request := &pb.AppendEntriesRequest{
 		Term:         int32(n.CurrentTerm),
 		LeaderID:     int32(n.Id),
@@ -202,9 +209,11 @@ func (n *Node) sendAppendEntries(peerID int) {
 		LeaderCommit: int32(n.CommitIndex),
 	}
 
+	n.Mu.Unlock()
+
 	response, err := SendRPCToPeer(peerID, "AppendEntries", request) // Implement sendRPCToPeer
 	if err != nil {
-		log.Printf("[Node %d] Failed to send AppendEntries to peer %d: %v", n.Id, peerID, err)
+		// log.Printf("[Node %d] Failed to send AppendEntries to peer %d: %v", n.Id, peerID, err)
 		return
 	}
 
@@ -212,7 +221,10 @@ func (n *Node) sendAppendEntries(peerID int) {
 }
 
 func (n *Node) processAppendEntriesResponse(peerID int, response *pb.AppendEntriesResponse) {
-    log.Printf("[Node %d] Received AppendEntries response from %d: %+v", n.Id, peerID, response)
+	n.Mu.Lock()
+	defer n.Mu.Unlock()
+
+	// log.Printf("[Node %d] Received AppendEntries response from %d: %+v", n.Id, peerID, response)
 
 	if int(response.Term) > n.CurrentTerm {
 		n.becomeFollower(int(response.Term))
@@ -223,7 +235,7 @@ func (n *Node) processAppendEntriesResponse(peerID int, response *pb.AppendEntri
 		// Update nextIndex and matchIndex for the follower
 		n.NextIndex[peerID] = len(n.Log)
 		n.MatchIndex[peerID] = len(n.Log) - 1
-        log.Printf("[Node %d] Updated nextIndex and matchIndex for %d: %d %d", n.Id, peerID, n.NextIndex[peerID], n.MatchIndex[peerID])
+		// log.Printf("[Node %d] Updated nextIndex and matchIndex for %d: %d %d", n.Id, peerID, n.NextIndex[peerID], n.MatchIndex[peerID])
 
 		// Update commitIndex if a majority agrees
 		n.updateCommitIndex()
@@ -246,13 +258,14 @@ func (n *Node) updateCommitIndex() {
 	if majorityIndex > n.CommitIndex && int(n.Log[majorityIndex].Term) == n.CurrentTerm {
 		// Call the callback for each committed log entry
 		for i := n.CommitIndex + 1; i <= majorityIndex; i++ {
-            n.CommandCh <- n.Log[i].Command
-			if n.Callbacks[i] != nil {
-				n.Callbacks[i] <- true
+			log.Printf("[Node %d] Applying command: %v (UUID: %s)", n.Id, n.Log[i].Command, n.Log[i].Uuid)
+			n.CommandCh <- n.Log[i].Command
+			if n.Callbacks[n.Log[i].Uuid] != nil {
+				n.Callbacks[n.Log[i].Uuid] <- true
 			}
 		}
 		n.CommitIndex = majorityIndex
-		log.Printf("[Node %d] Updated commitIndex to %d", n.Id, n.CommitIndex)
+		// log.Printf("[Node %d] Updated commitIndex to %d", n.Id, n.CommitIndex)
 	}
 }
 
@@ -264,31 +277,57 @@ func (n *Node) getLogTerm(index int) int {
 }
 
 func (n *Node) listenForRequests() {
-	for command := range n.RequestCh {
-        log.Printf("[Node %d] Received command: %v", n.Id, command)
-		err := n.applyCommand(command)
-        if err != nil {
-            log.Printf("[Node %d] Failed to apply command: %v", n.Id, err)
-        }
+	for {
+		select {
+		case command := <-n.RequestCh:
+			// log.Printf("[Node %d] Received command: %v", n.Id, command)
+			err := n.applyCommandRequest(command, "")
+			if err != nil {
+				log.Printf("[Node %d] Failed to apply command: %v", n.Id, err)
+			}
+		case request := <-n.PleaseCh:
+			// log.Printf("[Node %d] Received request: %v", n.Id, request)
+			err := n.applyCommandRequest(Request{Command: request.Command}, request.Uuid)
+			if err != nil {
+				log.Printf("[Node %d] Failed to apply command: %v", n.Id, err)
+			}
+		}
 	}
 }
 
-func (n *Node) applyCommand(command Request) error {
-	n.Mu.Lock()
-	defer n.Mu.Unlock()
-    log.Printf("[Node %d] Applying command: %v", n.Id, command)
+func (n *Node) applyCommandRequest(command Request, rUuid string) error {
+	if rUuid == "" {
+		rUuid = uuid.New().String()
+	}
+	n.Callbacks[rUuid] = command.Callback
+	
+	log.Printf("[Node %d] Applying command request: %v (UUID: %s)", n.Id, command.Command, rUuid)
 
 	if n.Role != Leader {
-		return fmt.Errorf("Node %d is not the leader", n.Id)
+		if n.LeaderId != nil {
+			res, err := SendRPCToPeer(*n.LeaderId, "PleaseDoThis", &pb.RequestPleaseRequest{Command: command.Command, Uuid: rUuid})
+			if err != nil {
+				return fmt.Errorf("failed to send command to leader: %v", err)
+			}
+			if res.(*pb.RequestPleaseResponse).Success {
+				return nil
+			} else {
+				return fmt.Errorf("leader failed to apply command")
+			}
+		}
+		return fmt.Errorf("Node %d doesn't know the leader", n.Id)
 	}
+
+	n.Mu.Lock()
+	defer n.Mu.Unlock()
 
 	// Append the command to the local log
 	entry := pb.LogEntry{
 		Term:    int32(n.CurrentTerm),
 		Command: command.Command,
+		Uuid:    rUuid,
 	}
 	n.Log = append(n.Log, &entry)
-	n.Callbacks = append(n.Callbacks, command.Callback)
 
 	// Update matchIndex and nextIndex for log replication
 	for _, peer := range n.Peers {
@@ -299,29 +338,34 @@ func (n *Node) applyCommand(command Request) error {
 }
 
 func (n *Node) AppendEntriesHandler(req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-    response := &pb.AppendEntriesResponse{
+	response := &pb.AppendEntriesResponse{
 		Term:    int32(n.CurrentTerm),
 		Success: false,
 	}
 
 	// Update term if necessary
 	if int(req.Term) > n.CurrentTerm {
+		n.LeaderId = new(int)
+		*n.LeaderId = int(req.LeaderID)
 		n.becomeFollower(int(req.Term))
 	}
 
 	// Reject if term is smaller
 	if int(req.Term) < n.CurrentTerm {
-        log.Printf("[Node %d] Rejecting AppendEntries from %d: term is smaller", n.Id, int(req.LeaderID))
+		// log.Printf("[Node %d] Rejecting AppendEntries from %d: term is smaller", n.Id, int(req.LeaderID))
 		return response, nil
 	}
+
+	n.LeaderId = new(int)
+	*n.LeaderId = int(req.LeaderID)
 
 	// Reset election timer (heartbeat)
 	n.resetElectionTimeout()
 
 	// Check log consistency
-	if int(req.PrevLogIndex) >= len(n.Log) || 
+	if int(req.PrevLogIndex) >= len(n.Log) ||
 		(int(req.PrevLogIndex) >= 0 && n.Log[req.PrevLogIndex].Term != req.PrevLogTerm) {
-        log.Printf("[Node %d] Rejecting AppendEntries from %d: log inconsistency", n.Id, int(req.LeaderID))
+		// log.Printf("[Node %d] Rejecting AppendEntries from %d: log inconsistency", n.Id, int(req.LeaderID))
 		return response, nil
 	}
 
@@ -335,27 +379,26 @@ func (n *Node) AppendEntriesHandler(req *pb.AppendEntriesRequest) (*pb.AppendEnt
 			}
 		}
 		if index >= len(n.Log) {
-			n.Log = append(n.Log, &pb.LogEntry{
-				Term:    int32(entry.Term),
-				Command: entry.Command,
-			})
-            n.Callbacks = append(n.Callbacks, nil)
+			n.Log = append(n.Log, entry)
 		}
 	}
 
 	// Update commit index
-    log.Printf("[Node %d] Leader commitIndex: %d, Node commitIndex: %d", n.Id, int(req.LeaderCommit), n.CommitIndex)
+	// log.Printf("[Node %d] Leader commitIndex: %d, Node commitIndex: %d", n.Id, int(req.LeaderCommit), n.CommitIndex)
 	if int(req.LeaderCommit) > n.CommitIndex {
-        prevCommitIndex := n.CommitIndex
+		prevCommitIndex := n.CommitIndex
 		n.CommitIndex = min(int(req.LeaderCommit), len(n.Log)-1)
-        log.Printf("[Node %d] Updated commitIndex to %d", n.Id, n.CommitIndex)
-        for i := prevCommitIndex + 1; i <= n.CommitIndex; i++ {
-            n.CommandCh <- n.Log[i].Command
-        }
+		for i := prevCommitIndex + 1; i <= n.CommitIndex; i++ {
+			log.Printf("[Node %d] Committing command: %v (UUID: %s)", n.Id, n.Log[i].Command, n.Log[i].Uuid)
+			n.CommandCh <- n.Log[i].Command
+			if n.Callbacks[n.Log[i].Uuid] != nil {
+				n.Callbacks[n.Log[i].Uuid] <- true
+			}
+		}
 	}
 
 	response.Success = true
-    log.Printf("[Node %d] Appended entries from %d: log=%v", n.Id, int(req.LeaderID), n.Log)
+	// log.Printf("[Node %d] Appended entries from %d: log=%v", n.Id, int(req.LeaderID), n.Log)
 	return response, nil
 }
 
@@ -367,12 +410,13 @@ func (n *Node) RequestVoteHandler(req *pb.RequestVoteRequest) (*pb.RequestVoteRe
 
 	// Update term if necessary
 	if int(req.Term) > n.CurrentTerm {
+		n.LeaderId = nil
 		n.becomeFollower(int(req.Term))
 	}
 
 	// Reject vote if term is stale
 	if int(req.Term) < n.CurrentTerm {
-        log.Printf("[Node %d] Rejecting vote for %d: term is stale", n.Id, int(req.CandidateID))
+		// log.Printf("[Node %d] Rejecting vote for %d: term is stale", n.Id, int(req.CandidateID))
 		return response, nil
 	}
 
@@ -384,27 +428,28 @@ func (n *Node) RequestVoteHandler(req *pb.RequestVoteRequest) (*pb.RequestVoteRe
 	lastLogIndex := len(n.Log) - 1
 	lastLogTerm := n.getLastLogTerm()
 
-	if int(req.LastLogTerm) < lastLogTerm || 
+	if int(req.LastLogTerm) < lastLogTerm ||
 		(int(req.LastLogTerm) == lastLogTerm && int(req.LastLogIndex) < lastLogIndex) {
-        log.Printf("[Node %d] Rejecting vote for %d: log is stale", n.Id, int(req.CandidateID))
+		// log.Printf("[Node %d] Rejecting vote for %d: log is stale", n.Id, int(req.CandidateID))
 		return response, nil
 	}
 
 	// Grant vote
 	n.VotedFor = new(int)
 	*n.VotedFor = int(req.CandidateID)
+	n.LeaderId = n.VotedFor
 	n.resetElectionTimeout()
 
 	response.VoteGranted = true
-    log.Printf("[Node %d] Voted for %d", n.Id, int(req.CandidateID))
+	// log.Printf("[Node %d] Voted for %d", n.Id, int(req.CandidateID))
 	return response, nil
 }
 
 func (n *Node) resetElectionTimeout() {
-    select {
-    case n.HeartbeatCh <- true:
-        log.Printf("[Node %d] Reset election timeout", n.Id)
-    default:
-        log.Printf("[Node %d] Election timeout channel is full", n.Id)
-    }
+	select {
+	case n.HeartbeatCh <- true:
+		// log.Printf("[Node %d] Reset election timeout", n.Id)
+	default:
+		// log.Printf("[Node %d] Election timeout channel is full", n.Id)
+	}
 }
