@@ -97,6 +97,7 @@ func main() {
 	fmt.Printf("OthersRaftPorts: %v\n", cli.OthersRaftPorts)
 
 	consensusManager := raft.NewConsensusManager(cli.InitValue, cli.MyRaftPort, cli.OthersRaftPorts)
+	consensusManager.Start()
 
 	makeHandlers(consensusManager)
 

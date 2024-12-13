@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -16,6 +17,13 @@ type ConsensusManager struct {
 	otherPorts  []int
 	raftStarted bool
 	raftCluster *RaftCluster
+	requestCh   chan raft.Request
+	commandCh   chan string
+}
+
+type Command struct {
+	Value     int    `json:"value"`
+	Operation string `json:"operation"`
 }
 
 type RaftCluster struct {
@@ -40,12 +48,17 @@ func (cm *ConsensusManager) Start() {
 		return
 	}
 	fmt.Printf("Starting Raft on port %d with peers %v...\n", cm.myPort, cm.otherPorts)
-	
+
 	cm.raftStarted = true
+	cm.requestCh = make(chan raft.Request, 20)
+	cm.commandCh = make(chan string)
+	node := raft.NewNode(cm.myPort, cm.otherPorts, cm.requestCh, cm.commandCh)
 	cm.raftCluster = &RaftCluster{
-		Node:        raft.NewNode(cm.myPort, cm.otherPorts),
-		RaftService: grpc.NewRaftService(nil, cm.myPort),
+		Node:        node,
+		RaftService: grpc.NewRaftService(node, cm.myPort),
 	}
+	cm.raftCluster.Node.StartElection()
+	go cm.listenForCommands()
 	cm.status = "Raft Started"
 }
 
@@ -55,16 +68,16 @@ func (cm *ConsensusManager) Get() int {
 	return cm.value
 }
 
-func (cm *ConsensusManager) Add(value int) {
-	cm.applyCommand("add", value)
+func (cm *ConsensusManager) Add(value int) error {
+	return cm.submitCommand(Command{Operation: "add", Value: value})
 }
 
-func (cm *ConsensusManager) Sub(value int) {
-	cm.applyCommand("sub", value)
+func (cm *ConsensusManager) Sub(value int) error {
+	return cm.submitCommand(Command{Operation: "sub", Value: value})
 }
 
-func (cm *ConsensusManager) Mul(value int) {
-	cm.applyCommand("mul", value)
+func (cm *ConsensusManager) Mul(value int) error {
+	return cm.submitCommand(Command{Operation: "mul", Value: value})
 }
 
 func (cm *ConsensusManager) GetStatus() string {
@@ -73,21 +86,48 @@ func (cm *ConsensusManager) GetStatus() string {
 	return cm.status
 }
 
-func (cm *ConsensusManager) applyCommand(command string, value int) {
+func (cm *ConsensusManager) submitCommand(command Command) error {
+	commandS, err := json.Marshal(command)
+	if err != nil {
+		fmt.Printf("Failed to marshal command: %v\n", err)
+		return err
+	}
+	cb := make(chan bool)
+	cm.requestCh <- raft.Request{Command: string(commandS), Callback: cb}
+	<-cb
+	return nil
+}
+
+func (cm *ConsensusManager) listenForCommands() {
+	for command := range cm.commandCh {
+		fmt.Printf("Received command: %s\n", command)
+		cm.applyCommand(command)
+		fmt.Printf("Current value: %d\n", cm.value)
+	}
+}
+
+func (cm *ConsensusManager) applyCommand(command string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	fmt.Printf("Applying command: %s %d\n", command, value)
-
-	switch command {
-	case "add":
-		cm.value += value
-	case "sub":
-		cm.value -= value
-	case "mul":
-		cm.value *= value
+	c := Command{}
+	err := json.Unmarshal([]byte(command), &c)
+	if err != nil {
+		fmt.Printf("Failed to unmarshal command: %v\n", err)
+		return
 	}
 
-	cm.status = fmt.Sprintf("Applied command: %s %d", command, value)
+	fmt.Printf("Applying command: %s %d\n", c.Operation, c.Value)
+
+	switch c.Operation {
+	case "add":
+		cm.value += c.Value
+	case "sub":
+		cm.value -= c.Value
+	case "mul":
+		cm.value *= c.Value
+	}
+
+	cm.status = fmt.Sprintf("Applied command: %s %d", c.Operation, c.Value)
 	fmt.Println("Command committed.")
 }
